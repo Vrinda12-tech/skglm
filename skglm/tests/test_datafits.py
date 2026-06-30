@@ -6,7 +6,7 @@ from sklearn.linear_model import HuberRegressor
 from numpy.testing import assert_allclose, assert_array_less
 
 from skglm.datafits import (Huber, Logistic, Poisson, Gamma, Cox, WeightedQuadratic,
-                            Quadratic, QuadraticHessian)
+                            Quadratic, QuadraticHessian,WeightedPoisson)
 from skglm.penalties import L1, WeightedL1
 from skglm.solvers import AndersonCD, ProxNewton
 from skglm import GeneralizedLinearEstimator
@@ -279,7 +279,209 @@ def test_HessianQuadratic():
     np.testing.assert_allclose(lasso.coef_, qpl1.coef_)
     # check that it's not just because we got alpha too high and thus 0 coef
     np.testing.assert_array_less(0.1, np.max(np.abs(qpl1.coef_)))
+# =============================================================================
+# Tests for WeightedPoisson
+# =============================================================================
 
+
+# =============================================================================
+# Tests for WeightedPoisson
+# =============================================================================
+
+
+def test_weighted_poisson_equality():
+    """Test that WeightedPoisson with equal weights matches Poisson."""
+    import numpy as np
+    from skglm.datafits import Poisson, WeightedPoisson
+
+    np.random.seed(42)
+    n_samples, n_features = 100, 10
+    X = np.random.randn(n_samples, n_features)
+    w_true = np.random.randn(n_features)
+    y = np.random.poisson(lam=np.exp(X @ w_true))
+
+    weights = np.ones(n_samples)
+    weighted = WeightedPoisson(weights)
+    weighted.initialize(X, y)
+    unweighted = Poisson()
+
+    w = np.random.randn(n_features)
+    Xw = X @ w
+
+    assert np.allclose(weighted.value(y, w, Xw), unweighted.value(y, w, Xw))
+    assert np.allclose(weighted.raw_grad(y, Xw), unweighted.raw_grad(y, Xw))
+    assert np.allclose(weighted.raw_hessian(y, Xw), unweighted.raw_hessian(y, Xw))
+
+    for j in range(n_features):
+        assert np.allclose(
+            weighted.gradient_scalar(X, y, w, Xw, j),
+            unweighted.gradient_scalar(X, y, w, Xw, j)
+        )
+
+
+def test_weighted_poisson_scaling():
+    """Test that weights correctly scale the loss and gradients."""
+    import numpy as np
+    from skglm.datafits import WeightedPoisson
+
+    np.random.seed(42)
+    n_samples, n_features = 50, 5
+    X = np.random.randn(n_samples, n_features)
+    w = np.random.randn(n_features)
+    y = np.random.poisson(lam=2, size=n_samples)
+    Xw = X @ w
+
+    weights = np.random.rand(n_samples)
+    wp = WeightedPoisson(weights)
+    wp.initialize(X, y)
+
+    weights_norm = weights / np.sum(weights)
+    expected_value = np.sum(weights_norm * (np.exp(Xw) - y * Xw))
+    expected_grad = weights_norm * (np.exp(Xw) - y)
+
+    assert np.allclose(wp.value(y, w, Xw), expected_value)
+    assert np.allclose(wp.raw_grad(y, Xw), expected_grad)
+
+
+def test_weighted_poisson_zero_weights():
+    """Test that samples with zero weight are ignored."""
+    import numpy as np
+    from skglm.datafits import WeightedPoisson
+
+    np.random.seed(42)
+    n_samples, n_features = 10, 5
+    X = np.random.randn(n_samples, n_features)
+    w = np.random.randn(n_features)
+    y = np.random.poisson(lam=2, size=n_samples)
+    Xw = X @ w
+
+    weights = np.ones(n_samples)
+    weights[0] = 0
+
+    wp = WeightedPoisson(weights)
+    wp.initialize(X, y)
+
+    raw_grad = wp.raw_grad(y, Xw)
+    assert raw_grad[0] == 0
+
+
+def test_weighted_poisson_validation():
+    """Test input validation for WeightedPoisson."""
+    import numpy as np
+    import pytest
+    from skglm.datafits import WeightedPoisson
+
+    n_samples = 10
+    X = np.random.randn(n_samples, 5)
+    y = np.random.poisson(lam=2, size=n_samples)
+
+    # Test 1: Negative y
+    y_neg = y.copy()
+    y_neg[0] = -1
+    with pytest.raises(ValueError, match="y must be non-negative"):
+        wp = WeightedPoisson(np.ones(n_samples))
+        wp.initialize(X, y_neg)
+
+    # Test 2: Negative weights
+    weights_neg = np.ones(n_samples)
+    weights_neg[0] = -1
+    with pytest.raises(ValueError, match="Weights must be non-negative"):
+        wp = WeightedPoisson(weights_neg)
+        wp.initialize(X, y)
+
+    # Test 3: Sum of weights = 0
+    weights_zero = np.zeros(n_samples)
+    with pytest.raises(ValueError, match="Sum of weights must be strictly greater than 0"):
+        wp = WeightedPoisson(weights_zero)
+        wp.initialize(X, y)
+
+    # Test 4: Shape mismatch
+    weights_wrong = np.ones(n_samples + 1)
+    with pytest.raises(ValueError, match="Shape mismatch"):
+        wp = WeightedPoisson(weights_wrong)
+        wp.initialize(X, y)
+
+
+def test_weighted_poisson_lipschitz():
+    """Test Lipschitz constant computation with weights."""
+    import numpy as np
+    from skglm.datafits import WeightedPoisson
+
+    np.random.seed(42)
+    n_samples, n_features = 50, 5
+    X = np.random.randn(n_samples, n_features)
+    y = np.random.poisson(lam=2, size=n_samples)
+
+    weights = np.random.rand(n_samples)
+    wp = WeightedPoisson(weights)
+    wp.initialize(X, y)
+
+    lipschitz = wp.get_lipschitz(X, y)
+
+    expected = np.array([np.sum(weights * X[:, j] ** 2) / np.sum(weights) for j in range(n_features)])
+
+    assert np.allclose(lipschitz, expected)
+
+
+def test_weighted_poisson_sparse():
+    """Test WeightedPoisson with sparse matrices."""
+    import numpy as np
+    from scipy.sparse import csc_matrix
+    from skglm.datafits import WeightedPoisson
+
+    np.random.seed(42)
+    n_samples, n_features = 50, 10
+
+    X_dense = np.random.randn(n_samples, n_features)
+    X_dense[np.random.rand(*X_dense.shape) > 0.2] = 0
+    X_sparse = csc_matrix(X_dense)
+
+    y = np.random.poisson(lam=2, size=n_samples)
+    w = np.random.randn(n_features)
+    Xw = X_dense @ w
+
+    weights = np.random.rand(n_samples)
+    wp = WeightedPoisson(weights)
+    wp.initialize(X_dense, y)
+
+    for j in range(n_features):
+        grad_dense = wp.gradient_scalar(X_dense, y, w, Xw, j)
+        grad_sparse = wp.gradient_scalar_sparse(
+            X_sparse.data, X_sparse.indptr, X_sparse.indices, y, Xw, j
+        )
+        assert np.allclose(grad_dense, grad_sparse)
+
+
+def test_weighted_poisson_integration():
+    """Test WeightedPoisson with GeneralizedLinearEstimator."""
+    import numpy as np
+    from skglm import GeneralizedLinearEstimator
+    from skglm.datafits import WeightedPoisson
+    from skglm.penalties import L1
+    from skglm.solvers import ProxNewton  # <-- EXPLICITLY USE ProxNewton
+
+    np.random.seed(42)
+    n_samples, n_features = 100, 10
+    X = np.random.randn(n_samples, n_features)
+    w_true = np.random.randn(n_features)
+    y = np.random.poisson(lam=np.exp(X @ w_true))
+
+    weights = np.random.rand(n_samples)
+
+    model = GeneralizedLinearEstimator(
+        datafit=WeightedPoisson(weights),
+        penalty=L1(alpha=0.1),
+        solver=ProxNewton(tol=1e-8, fit_intercept=False)  # <-- ProxNewton
+    )
+    model.fit(X, y)
+
+    assert model.coef_ is not None
+    assert model.n_iter_ > 0
+    assert not np.any(np.isnan(model.coef_))
+    assert not np.any(np.isinf(model.coef_))
+
+    preds = model.predict(X)
+    assert np.all(preds > 0)
 
 if __name__ == '__main__':
     pass
